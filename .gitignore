@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+data/*.db
+data/*.json
+
+output/
+evidence/
+
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+.env
+.ipynb_checkpoints/
