@@ -1,27 +1,51 @@
+%cd /content/sentinel
+
+events_code = r'''
 from datetime import datetime
+import math
 
 
 class SentinelEventEngine:
+
     def __init__(
         self,
         camera_name="Camera",
-        crowd_threshold=10,
+        crowd_threshold=8,
         loitering_time=10,
-        allowed_direction="right",
-        min_movement=5,
+        loitering_radius=60,
+        max_stationary_path=120,
         restricted_zone=None
     ):
         self.camera_name = camera_name
+
         self.crowd_threshold = crowd_threshold
         self.loitering_time = loitering_time
-        self.allowed_direction = allowed_direction
-        self.min_movement = min_movement
+        self.loitering_radius = loitering_radius
+        self.max_stationary_path = max_stationary_path
         self.restricted_zone = restricted_zone
 
-        self.first_seen = {}
-        self.previous_positions = {}
+        self.track_state = {}
         self.triggered = set()
         self.incidents = []
+
+        # Crowd state
+        self.crowd_active = False
+
+    # ----------------------------------------------------------
+    # Utility
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def distance(p1, p2):
+
+        return math.sqrt(
+            (p1[0] - p2[0]) ** 2 +
+            (p1[1] - p2[1]) ** 2
+        )
+
+    # ----------------------------------------------------------
+    # Incident creation
+    # ----------------------------------------------------------
 
     def incident(
         self,
@@ -31,6 +55,7 @@ class SentinelEventEngine:
         track_id=None,
         severity="MEDIUM"
     ):
+
         incident_id = (
             f"SNT-{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
             f"{len(self.incidents) + 1:04d}"
@@ -41,8 +66,8 @@ class SentinelEventEngine:
             "Event": event,
             "Camera": self.camera_name,
             "Person_ID": track_id,
-            "Timestamp_seconds": round(timestamp, 2),
-            "Frame": frame,
+            "Timestamp_seconds": round(float(timestamp), 2),
+            "Frame": int(frame),
             "Severity": severity,
             "Status": "OPEN"
         }
@@ -51,73 +76,135 @@ class SentinelEventEngine:
 
         return item
 
+    # ----------------------------------------------------------
+    # Main event processing
+    # ----------------------------------------------------------
+
     def process(self, objects, frame_number, timestamp):
 
         people = [
             obj for obj in objects
-            if obj["class_id"] == 0
+            if obj.get("class_id") == 0
         ]
 
-        # -----------------------------
-        # CROWD DETECTION
-        # -----------------------------
-        if len(people) >= self.crowd_threshold:
+        # ======================================================
+        # 1. CROWD DETECTION
+        # ======================================================
 
-            key = ("crowd", frame_number // 30)
+        current_crowd = len(people) >= self.crowd_threshold
 
-            if key not in self.triggered:
+        # Trigger only when crowd condition STARTS
+        if current_crowd and not self.crowd_active:
 
-                self.triggered.add(key)
-
-                self.incident(
-                    "Crowd Detected",
-                    frame_number,
-                    timestamp,
-                    severity="MEDIUM"
-                )
-
-        # -----------------------------
-        # PERSON-BASED EVENTS
-        # -----------------------------
-        for obj in people:
-
-            track_id = obj["track_id"]
-            center = obj["center"]
-
-            if track_id is None:
-                continue
-
-            # First time seeing this person
-            if track_id not in self.first_seen:
-                self.first_seen[track_id] = timestamp
-
-            duration = (
-                timestamp -
-                self.first_seen[track_id]
+            self.incident(
+                event="Crowd Detected",
+                frame=frame_number,
+                timestamp=timestamp,
+                severity="MEDIUM"
             )
 
-            # -----------------------------
+        # Update crowd state
+        self.crowd_active = current_crowd
+
+        # ======================================================
+        # 2. PERSON TRACKING / LOITERING
+        # ======================================================
+
+        for obj in people:
+
+            track_id = obj.get("track_id")
+            center = obj.get("center")
+
+            if track_id is None or center is None:
+                continue
+
+            # --------------------------------------------------
+            # New track
+            # --------------------------------------------------
+
+            if track_id not in self.track_state:
+
+                self.track_state[track_id] = {
+                    "anchor": center,
+                    "last_position": center,
+                    "stationary_since": timestamp,
+                    "path_length": 0.0,
+                    "last_seen": timestamp
+                }
+
+            state = self.track_state[track_id]
+
+            # --------------------------------------------------
+            # Movement calculation
+            # --------------------------------------------------
+
+            step_distance = self.distance(
+                center,
+                state["last_position"]
+            )
+
+            displacement = self.distance(
+                center,
+                state["anchor"]
+            )
+
+            # Accumulate actual movement
+            state["path_length"] += step_distance
+
+            # --------------------------------------------------
             # LOITERING
-            # -----------------------------
-            if duration >= self.loitering_time:
+            #
+            # Person must:
+            # 1. Stay near the same area
+            # 2. Not travel too far
+            # 3. Remain there for required duration
+            # --------------------------------------------------
 
-                key = ("loiter", track_id)
+            still_in_area = (
+                displacement <= self.loitering_radius
+            )
 
-                if key not in self.triggered:
+            not_traveling = (
+                state["path_length"] <= self.max_stationary_path
+            )
 
-                    self.triggered.add(key)
+            duration = (
+                timestamp - state["stationary_since"]
+            )
 
-                    self.incident(
-                        "Loitering Detected",
-                        frame_number,
-                        timestamp,
-                        track_id,
-                        "MEDIUM"
-                    )
+            if still_in_area and not_traveling:
 
-            # -----------------------------
-            # RESTRICTED AREA INTRUSION
-            # -----------------------------
+                if duration >= self.loitering_time:
+
+                    key = ("loiter", track_id)
+
+                    if key not in self.triggered:
+
+                        self.triggered.add(key)
+
+                        self.incident(
+                            event="Loitering Detected",
+                            frame=frame_number,
+                            timestamp=timestamp,
+                            track_id=track_id,
+                            severity="MEDIUM"
+                        )
+
+            else:
+
+                # Person moved away.
+                # Start a fresh stationary period.
+                state["anchor"] = center
+                state["stationary_since"] = timestamp
+                state["path_length"] = 0.0
+
+            state["last_position"] = center
+            state["last_seen"] = timestamp
+
+            # ==================================================
+            # 3. RESTRICTED AREA INTRUSION
+            # ==================================================
+
             if self.restricted_zone:
 
                 x1, y1, x2, y2 = self.restricted_zone
@@ -125,7 +212,8 @@ class SentinelEventEngine:
                 x, y = center
 
                 inside_zone = (
-                    x1 <= x <= x2 and
+                    x1 <= x <= x2
+                    and
                     y1 <= y <= y2
                 )
 
@@ -138,18 +226,41 @@ class SentinelEventEngine:
                         self.triggered.add(key)
 
                         self.incident(
-                            "Restricted Area Intrusion",
-                            frame_number,
-                            timestamp,
-                            track_id,
-                            "HIGH"
+                            event="Restricted Area Intrusion",
+                            frame=frame_number,
+                            timestamp=timestamp,
+                            track_id=track_id,
+                            severity="HIGH"
                         )
 
-            # Save previous position
-            self.previous_positions[track_id] = center
+        # ------------------------------------------------------
+        # Remove stale tracks
+        # ------------------------------------------------------
+
+        stale_ids = []
+
+        for track_id, state in self.track_state.items():
+
+            if timestamp - state["last_seen"] > 3:
+
+                stale_ids.append(track_id)
+
+        for track_id in stale_ids:
+
+            self.track_state.pop(track_id, None)
 
         return self.incidents
 
 
 if __name__ == "__main__":
-    print("SENTINEL Event Engine ready")
+    print("✅ SENTINEL Event Engine ready")
+'''
+
+with open("/content/sentinel/app/events.py", "w") as f:
+    f.write(events_code)
+
+print("✅ SENTINEL Event Engine updated")
+print()
+print("Crowd: one incident when a crowd begins.")
+print("Loitering: requires low movement + same area + 10 seconds.")
+print("Intrusion: one incident per tracked person entering the zone.")
